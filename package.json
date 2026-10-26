@@ -12,8 +12,8 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "test": "node --test tests/*.test.mjs",
-    "dist:win": "npm run build && electron-builder --win nsis",
-    "dist:mac": "npm run build && electron-builder --mac dmg"
+    "dist:win": "npm run build && electron-builder --win nsis --publish never",
+    "dist:mac": "npm run build && electron-builder --mac dmg --publish never"
   },
   "dependencies": {},
   "devDependencies": {
