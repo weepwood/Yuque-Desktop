@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "lib": ["DOM", "ES2022"], "types": ["vite/client"], "noEmit": true },
+  "include": ["src/renderer/src/**/*.ts", "src/renderer/src/**/*.vue", "src/shared/**/*.ts"]
+}
