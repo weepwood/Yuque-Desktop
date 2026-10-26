@@ -103,6 +103,7 @@ function ipc(): void {
   handle('logout',async()=>{
     // Destroy only this app's separate browsing partition; never touch the user's real browser cookies.
     await session.fromPartition(PARTITION).clearStorageData()
+    if (activeAccount) cache.forgetAccount(activeAccount.id)
     if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close()
     updateAuth({state:'signed-out'})
   })

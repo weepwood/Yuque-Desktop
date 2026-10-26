@@ -55,8 +55,10 @@ const documentTitle = computed(()=>activeDoc.value?.title || noteTitle(activeNot
 const recordUrl = computed(()=>{
   if(activeNote.value) return activeNote.value.slug ? 'https://www.yuque.com/r/note/'+encodeURIComponent(activeNote.value.slug) : ''
   if(!activeDoc.value || !currentBook.value || !account.value) return ''
-  const owner=activeDoc.value.user?.login || account.value.login
-  return 'https://www.yuque.com/'+encodeURIComponent(owner)+'/'+encodeURIComponent(currentBook.value.slug)+'/'+encodeURIComponent(activeDoc.value.slug)
+  const book=currentBook.value
+  const owner=book.user?.login || book.group?.login || book.namespace?.split('/')[0]
+  if(!owner)return ''
+  return 'https://www.yuque.com/'+encodeURIComponent(owner)+'/'+encodeURIComponent(book.slug)+'/'+encodeURIComponent(activeDoc.value.slug)
 })
 function filterBook(b:Book):boolean { return !bookFilter.value || b.name.toLowerCase().includes(bookFilter.value.toLowerCase()) }
 function textOnly(raw:string):string {
@@ -113,7 +115,6 @@ function changeTheme():void {dark.value=!dark.value;updateTheme()}
 async function bootstrap():Promise<void>{
   try {
     auth.value=await window.yuque.authState()
-    if(connected.value)await loadBooks()
   }catch(e){showError(e)}
 }
 async function startLogin():Promise<void>{

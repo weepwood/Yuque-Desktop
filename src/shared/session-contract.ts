@@ -1,7 +1,7 @@
 /** Internal, undocumented Yuque API response shapes. See docs/internal-api.md. */
 export interface Account { id: number; login: string; name: string; avatar_url?: string; memberLevelName?: string }
 export interface Team { id: number; login: string; name: string; books_count?: number; public_books_count?: number }
-export interface Book { id: number; slug: string; name: string; type: string; items_count?: number; content_updated_at?: string; public?: number; book_icon?: { type: string; url?: string }; user_id?: number }
+export interface Book { id: number; slug: string; name: string; type: string; items_count?: number; content_updated_at?: string; public?: number; book_icon?: { type: string; url?: string }; user_id?: number; namespace?: string; user?: { login: string }; group?: { login: string } }
 export interface CatalogNode { id: number; doc_id: number; uuid: string; parent_uuid: string; sibling_uuid: string; child_uuid: string; prev_uuid: string; title: string; url: string; type: 'DOC' | 'TITLE' | string; level: number; visible: number }
 export interface YuqueDocument { id: number; book_id: number; slug: string; title: string; content: string; content_updated_at?: string; updated_at?: string; word_count?: number; status?: number; public?: number; user?: { login: string } }
 export interface Note { id: number; slug: string; content: { abstract?: string; html?: string; source?: string; format?: string }; word_count?: number; updated_at?: string; pinned_at?: string | null; tags?: string[] }

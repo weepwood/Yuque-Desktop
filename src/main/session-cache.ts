@@ -40,5 +40,9 @@ export class SessionCache {
       .run(id, key, JSON.stringify(data), now)
     return { value: data, stale: false, fetchedAt: now }
   }
+  forgetAccount(id: number): void {
+    this.database.prepare('DELETE FROM cache WHERE account_id=?').run(id)
+    this.database.prepare("DELETE FROM account WHERE key='last'").run()
+  }
   close(): void { this.database.close() }
 }
