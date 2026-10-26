@@ -1,8 +1,8 @@
 {
   "name": "yuque-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "An independent, local-first Yuque desktop client",
+  "description": "An Electron desktop reader for Yuque using isolated browser sessions and observed internal APIs",
   "main": "./out/main/index.js",
   "author": "WEEPWOOD",
   "license": "MIT",

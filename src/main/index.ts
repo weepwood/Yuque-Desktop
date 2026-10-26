@@ -1,195 +1,187 @@
 import { app, BrowserWindow, ipcMain, protocol, session, shell } from 'electron'
-import { join, resolve, relative, extname } from 'node:path'
-import { readFile } from 'node:fs/promises'
-import { mkdirSync } from 'node:fs'
 import type { IpcMainInvokeEvent } from 'electron'
-import type { Session, YuqueUser, DocumentDetail } from '../shared/types'
-import { normalizeHost, YuqueClient } from './yuque'
-import { LocalDatabase } from './database'
-import { CredentialVault } from './credentials'
-import { publishDraft } from './sync'
+import { join, resolve, relative, extname } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import type { AuthState, Account, Loaded } from '../shared/session-contract'
+import { requireId, limitQuery } from '../shared/session-contract'
+import { InternalYuqueApi, YuqueHttpError } from './session-api'
+import { SessionCache } from './session-cache'
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true } }])
-
-let mainWindow: BrowserWindow | null = null
-let db: LocalDatabase
-let vault: CredentialVault
+const PARTITION = 'persist:yuque-web-login'
+const YUQUE_ORIGIN = 'https://www.yuque.com'
 const development = Boolean(process.env.ELECTRON_RENDERER_URL)
-const contentTypes: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png',
-  '.woff2': 'font/woff2', '.json': 'application/json; charset=utf-8'
+const mime: Record<string,string> = {
+  '.html':'text/html; charset=utf-8', '.js':'text/javascript; charset=utf-8',
+  '.css':'text/css; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png',
+  '.woff2':'font/woff2', '.json':'application/json; charset=utf-8'
 }
+let windowMain: BrowserWindow | null = null
+let loginWindow: BrowserWindow | null = null
+let cache: SessionCache
+let api: InternalYuqueApi
+let activeAccount: Account | undefined
+let authState: AuthState = { state:'signed-out' }
 
-function validateSender(event: IpcMainInvokeEvent): void {
-  if (!mainWindow || event.sender !== mainWindow.webContents || !event.senderFrame) throw new Error('IPC 来源不可信')
-  const url = new URL(event.senderFrame.url)
-  const valid = development
-    ? url.origin === new URL(process.env.ELECTRON_RENDERER_URL!).origin
-    : url.protocol === 'app:' && url.hostname === 'yuque'
-  if (!valid || event.senderFrame !== mainWindow.webContents.mainFrame) throw new Error('拒绝非主窗口 IPC 调用')
+function trustedFrame(e: IpcMainInvokeEvent): void {
+  if (!windowMain || e.sender !== windowMain.webContents || !e.senderFrame || e.senderFrame !== windowMain.webContents.mainFrame)
+    throw new Error('拒绝不可信 IPC 来源')
+  const url = new URL(e.senderFrame.url)
+  if (development ? url.origin !== new URL(process.env.ELECTRON_RENDERER_URL!).origin : url.protocol !== 'app:' || url.hostname !== 'yuque')
+    throw new Error('拒绝外部页面 IPC')
 }
-
-function handle(name: string, fn: (...args: any[]) => Promise<unknown> | unknown): void {
-  ipcMain.handle(`yuque:${name}`, async (event, ...args: unknown[]) => {
-    validateSender(event)
+function handle(name: string, fn: (...args: any[]) => unknown): void {
+  ipcMain.handle('yuque:'+name, async (event,...args:unknown[]) => {
+    trustedFrame(event)
     return fn(...args)
   })
 }
-
-function sessionState(): Session {
-  const userJson = db.setting('user')
-  const host = db.setting('host') || 'https://www.yuque.com'
-  const hasToken = Boolean(vault.get())
-  const user = userJson ? JSON.parse(userJson) as YuqueUser : undefined
-  return { connected: hasToken && Boolean(user), host, user }
+function updateAuth(next: AuthState): AuthState {
+  authState=next
+  activeAccount=next.account
+  windowMain?.webContents.send('yuque:auth-changed', next)
+  return next
 }
-
-function client(): YuqueClient {
-  const token = vault.get()
-  if (!token) throw new Error('请先连接语雀 Token')
-  return new YuqueClient(normalizeHost(db.setting('host') || 'https://www.yuque.com'), token)
+async function probe(): Promise<AuthState> {
+  const current = session.fromPartition(PARTITION)
+  const cookies=await current.cookies.get({url:YUQUE_ORIGIN,name:'_yuque_session'})
+  if (!cookies.length) return updateAuth({state:'signed-out'})
+  try {
+    const account=await api.mine()
+    cache.setAccount(account)
+    const result=updateAuth({state:'authenticated',account})
+    if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close()
+    return result
+  } catch(e) {
+    if (e instanceof YuqueHttpError && [401,403].includes(e.status)) return updateAuth({state:'signed-out'})
+    const account=cache.account()
+    if (account) return updateAuth({state:'offline',account})
+    return updateAuth({state:'signed-out'})
+  }
 }
-function resourceId(v: unknown): number {
-  const x = Number(v)
-  if (!Number.isSafeInteger(x) || x <= 0) throw new Error('无效的资源编号')
-  return x
+function assertAccount(): number {
+  if (!activeAccount || authState.state === 'signed-out') throw new Error('请先通过语雀网页登录')
+  return activeAccount.id
 }
-function checkPlainObject(v: unknown): Record<string, unknown> {
-  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('无效的请求参数')
-  return v as Record<string, unknown>
+async function readCached<T>(key:string, action:()=>Promise<T>):Promise<Loaded<T>> {
+  const id=assertAccount()
+  try { return cache.set(id,key,await action()) }
+  catch(e) {
+    // Authentication/authorization errors must not silently return cached private data.
+    if (e instanceof YuqueHttpError && e.status < 500) throw e
+    const cached=cache.get<T>(id,key)
+    if (cached) return cached
+    throw e
+  }
 }
-
-function createHandlers(): void {
-  handle('session', () => sessionState())
-  handle('connect', async (input: unknown) => {
-    const value = checkPlainObject(input)
-    if (typeof value.token !== 'string' || value.token.length < 6 || value.token.length > 1024) throw new Error('请输入有效的 Token')
-    if (typeof value.host !== 'string' || value.host.length > 255) throw new Error('无效的站点地址')
-    const host = normalizeHost(value.host)
-    const api = new YuqueClient(host, value.token.trim())
-    const user = await api.user() // Verify before saving credentials.
-    const previous = db.setting('user')
-    const previousUser = previous ? JSON.parse(previous) as YuqueUser : undefined
-    if (previousUser && (previousUser.id !== user.id || db.setting('host') !== new URL(host).origin)) db.resetForAccount()
-    vault.save(value.token.trim())
-    db.setSetting('user', JSON.stringify(user))
-    db.setSetting('host', new URL(host).origin)
-    return sessionState()
+function beginLogin(): void {
+  if (loginWindow && !loginWindow.isDestroyed()) { loginWindow.focus(); return }
+  const webSession=session.fromPartition(PARTITION)
+  loginWindow=new BrowserWindow({
+    width:1100,height:780,minWidth:760,minHeight:620,
+    title:'登录语雀',backgroundColor:'#ffffff',autoHideMenuBar:true,
+    webPreferences:{session:webSession,contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true,webviewTag:false}
   })
-  handle('disconnect', () => {
-    db.resetForAccount() // Unpublished drafts must never be silently discarded.
-    vault.clear()
-    db.removeSetting('user')
-    db.removeSetting('host')
+  const authWindow=loginWindow
+  authWindow.webContents.on('will-navigate',(event,url)=>{
+    if (!url.startsWith('https://')) event.preventDefault()
   })
-  handle('list-repos', async () => {
-    const user = sessionState().user
-    if (!user) throw new Error('请先连接账号')
-    try {
-      const repos = await client().repositories(user.login)
-      db.saveRepos(repos)
-      return repos
-    } catch (e) { const cached = db.repos(); if (cached.length) return cached; throw e }
+  authWindow.webContents.setWindowOpenHandler(({url})=> {
+    if (!url.startsWith('https://')) return { action:'deny' }
+    return {action:'allow',overrideBrowserWindowOptions:{
+      autoHideMenuBar:true,
+      webPreferences:{session:webSession,contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true,webviewTag:false}
+    }}
   })
-  handle('list-docs', async (repo: unknown) => {
-    const id = resourceId(repo)
-    try {
-      const docs = await client().docs(id)
-      db.saveDocMeta(docs)
-      return docs
-    } catch (e) { const cached = db.docs(id); if (cached.length) return cached; throw e }
+  authWindow.on('closed',()=>{if(loginWindow===authWindow)loginWindow=null;void probe()})
+  void authWindow.loadURL('https://www.yuque.com/login').catch(()=>{})
+}
+function ipc(): void {
+  handle('auth-state',()=>probe())
+  handle('login',()=>beginLogin())
+  handle('logout',async()=>{
+    // Destroy only this app's separate browsing partition; never touch the user's real browser cookies.
+    await session.fromPartition(PARTITION).clearStorageData()
+    if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close()
+    updateAuth({state:'signed-out'})
   })
-  handle('open-doc', async (repo: unknown, id: unknown) => {
-    const repoId = resourceId(repo), docId = resourceId(id)
-    try {
-      const doc = await client().doc(repoId, docId)
-      db.saveDoc(doc)
-      return { doc, draft: db.draft(repoId, docId) }
-    } catch (e) {
-      const doc = db.doc(docId)
-      if (doc && doc.book_id === repoId) return { doc, draft: db.draft(repoId, docId) }
-      throw e
-    }
+  handle('books',()=>readCached('books',()=>api.books()))
+  handle('teams',()=>readCached('teams',()=>api.teams()))
+  handle('catalog',(bookId:unknown)=>{
+    const id=requireId(bookId)
+    return readCached('catalog:'+id,()=>api.catalog(id))
   })
-  handle('save-draft', (input: unknown) => {
-    const val = checkPlainObject(input)
-    const repoId = resourceId(val.repoId), docId = resourceId(val.docId)
-    if (typeof val.content !== 'string' || Buffer.byteLength(val.content) > 4 * 1024 * 1024) throw new Error('草稿大小超过 4 MB')
-    if (typeof val.baseUpdatedAt !== 'string' || !val.baseUpdatedAt || val.baseUpdatedAt.length > 100) throw new Error('缺少云端版本标识，无法安全保存')
-    const current = db.doc(docId)
-    if (!current || current.book_id !== repoId || !current.editable) throw new Error('此文档暂不支持编辑')
-    const oldDraft = db.draft(repoId, docId)
-    const base = oldDraft?.baseUpdatedAt || current.baseUpdatedAt
-    db.saveDraft(repoId, docId, val.content, base)
+  handle('document',(bookId:unknown,docId:unknown)=>{
+    const book=requireId(bookId),doc=requireId(docId)
+    return readCached('document:'+book+':'+doc,()=>api.document(book,doc))
   })
-  handle('publish', async (input: unknown): Promise<DocumentDetail> => {
-    const val = checkPlainObject(input)
-    const repoId = resourceId(val.repoId), docId = resourceId(val.docId)
-    return publishDraft(db, client(), repoId, docId)
+  handle('search',(q:unknown)=>api.search(limitQuery(q)))
+  handle('notes',(offset:unknown,search:unknown)=>{
+    if (!Number.isSafeInteger(offset)||Number(offset)<0||Number(offset)>100000) throw new Error('非法分页偏移量')
+    const query=limitQuery(search)
+    return readCached('notes:'+offset+':'+query,()=>api.notes(Number(offset),query))
   })
-  handle('create-doc', async (input: unknown) => {
-    const val = checkPlainObject(input)
-    const repoId = resourceId(val.repoId)
-    if (typeof val.title !== 'string' || !val.title.trim()) throw new Error('请输入文档标题')
-    const doc = await client().create(repoId, val.title)
-    db.saveDocMeta([doc])
-    return doc
+  handle('note',(id:unknown)=>{
+    const noteId=requireId(id)
+    return readCached('note:'+noteId,()=>api.note(noteId))
   })
-  handle('open-external', async (value: unknown) => {
-    if (typeof value !== 'string') throw new Error('URL 参数错误')
-    const url = new URL(value)
-    if (url.protocol !== 'https:' || !/^(?:[a-z0-9-]+\.)*yuque\.com$/i.test(url.hostname)) throw new Error('只允许打开官方语雀链接')
+  handle('tags',()=>readCached('tags',()=>api.tags()))
+  handle('open-external',async(target:unknown)=>{
+    if(typeof target!=='string'||target.length>2048) throw new Error('非法链接')
+    const url=new URL(target)
+    if(url.protocol!=='https:'||url.hostname!=='www.yuque.com'||url.username||url.password) throw new Error('仅允许打开语雀官方链接')
     await shell.openExternal(url.href)
   })
 }
-
-async function createWindow(): Promise<void> {
-  mainWindow = new BrowserWindow({
-    width: 1440, height: 920, minWidth: 900, minHeight: 650,
-    backgroundColor: '#f6f7f9', title: 'Yuque Desktop',
-    show: false,
-    autoHideMenuBar: true,
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      contextIsolation: true, sandbox: true, nodeIntegration: false,
-      webSecurity: true, webviewTag: false
+async function openMain():Promise<void> {
+  windowMain=new BrowserWindow({
+    width:1480,height:940,minWidth:920,minHeight:660,show:false,
+    title:'Yuque Desktop',backgroundColor:'#f6f7f9',autoHideMenuBar:true,
+    titleBarStyle:process.platform==='darwin'?'hiddenInset':'default',
+    webPreferences:{
+      preload:join(__dirname,'../preload/index.js'),
+      contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true,webviewTag:false
     }
   })
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-  mainWindow.webContents.on('will-navigate', event => event.preventDefault())
-  if (development) await mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL!)
-  else await mainWindow.loadURL('app://yuque/index.html')
+  windowMain.once('ready-to-show',()=>windowMain?.show())
+  windowMain.webContents.setWindowOpenHandler(()=>({action:'deny'}))
+  windowMain.webContents.on('will-navigate',event=>event.preventDefault())
+  if(development) await windowMain.loadURL(process.env.ELECTRON_RENDERER_URL!)
+  else await windowMain.loadURL('app://yuque/index.html')
+  void probe()
 }
-
-app.whenReady().then(async () => {
-  const dir = app.getPath('userData')
-  mkdirSync(dir, { recursive: true })
-  db = new LocalDatabase(dir)
-  vault = new CredentialVault(dir)
-  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false))
-  if (!development) {
-    const root = resolve(__dirname, '../renderer')
-    protocol.handle('app', async request => {
-      try {
-        const url = new URL(request.url)
-        if (url.hostname !== 'yuque') return new Response('Forbidden', { status: 403 })
-        const pathname = decodeURIComponent(url.pathname)
-        const name = pathname === '/' ? 'index.html' : pathname.replace(/^\//, '')
-        const full = resolve(root, name)
-        const rel = relative(root, full)
-        if (rel.startsWith('..') || rel.startsWith('/') || !rel) return new Response('Forbidden', { status: 403 })
-        const bytes = await readFile(full)
-        return new Response(new Uint8Array(bytes), { headers: { 'Content-Type': contentTypes[extname(full)] || 'application/octet-stream' } })
-      } catch { return new Response('Not found', { status: 404 }) }
+app.whenReady().then(async()=>{
+  mkdirSync(app.getPath('userData'),{recursive:true})
+  cache=new SessionCache(app.getPath('userData'))
+  const webSession=session.fromPartition(PARTITION)
+  webSession.setPermissionRequestHandler((_webContents,_permission,callback)=>callback(false))
+  api=new InternalYuqueApi(webSession)
+  webSession.cookies.on('changed',(_event,cookie,_cause,removed)=>{
+    if(cookie.name==='_yuque_session' && !removed) void probe()
+  })
+  session.defaultSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false))
+  if(!development){
+    const root=resolve(__dirname,'../renderer')
+    protocol.handle('app',async(request)=>{
+      try{
+        const url=new URL(request.url)
+        if(url.hostname!=='yuque') return new Response('Forbidden',{status:403})
+        const path=decodeURIComponent(url.pathname)
+        const filename=path==='/'?'index.html':path.replace(/^\//,'')
+        const full=resolve(root,filename),rel=relative(root,full)
+        if(rel.startsWith('..')||rel.startsWith('/')||!rel) return new Response('Forbidden',{status:403})
+        const bytes=await readFile(full)
+        return new Response(new Uint8Array(bytes),{headers:{
+          'Content-Type':mime[extname(full)]||'application/octet-stream',
+          'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'none'; frame-src 'self' about:; object-src 'none'; base-uri 'none'"
+        }})
+      }catch{return new Response('Not found',{status:404})}
     })
   }
-  createHandlers()
-  await createWindow()
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow() })
-}).catch(error => { console.error('Failed to start:', error); app.quit() })
-
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
-app.on('will-quit', () => db?.close())
+  ipc()
+  await openMain()
+  app.on('activate',()=>{if(BrowserWindow.getAllWindows().length===0)void openMain()})
+}).catch(e=>{console.error('Application startup failed',e);app.quit()})
+app.on('window-all-closed',()=>{if(process.platform!=='darwin')app.quit()})
+app.on('will-quit',()=>cache?.close())

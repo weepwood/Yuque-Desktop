@@ -1,17 +1,23 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { DesktopBridge } from '../shared/types'
+import type { YuqueSessionBridge, AuthState } from '../shared/session-contract'
 
-// Explicit methods only. No generic invoke(), filesystem API or raw Electron objects.
-const desktop: DesktopBridge = {
-  session: () => ipcRenderer.invoke('yuque:session'),
-  connect: input => ipcRenderer.invoke('yuque:connect', input),
-  disconnect: () => ipcRenderer.invoke('yuque:disconnect'),
-  listRepos: () => ipcRenderer.invoke('yuque:list-repos'),
-  listDocs: id => ipcRenderer.invoke('yuque:list-docs', id),
-  openDoc: (repoId, docId) => ipcRenderer.invoke('yuque:open-doc', repoId, docId),
-  saveDraft: input => ipcRenderer.invoke('yuque:save-draft', input),
-  publish: input => ipcRenderer.invoke('yuque:publish', input),
-  createDoc: input => ipcRenderer.invoke('yuque:create-doc', input),
-  openExternal: url => ipcRenderer.invoke('yuque:open-external', url)
+const bridge: YuqueSessionBridge = {
+  authState:()=>ipcRenderer.invoke('yuque:auth-state'),
+  login:()=>ipcRenderer.invoke('yuque:login'),
+  logout:()=>ipcRenderer.invoke('yuque:logout'),
+  books:()=>ipcRenderer.invoke('yuque:books'),
+  teams:()=>ipcRenderer.invoke('yuque:teams'),
+  catalog:(bookId)=>ipcRenderer.invoke('yuque:catalog',bookId),
+  document:(bookId,docId)=>ipcRenderer.invoke('yuque:document',bookId,docId),
+  search:(query)=>ipcRenderer.invoke('yuque:search',query),
+  notes:(offset,query)=>ipcRenderer.invoke('yuque:notes',offset,query),
+  note:(id)=>ipcRenderer.invoke('yuque:note',id),
+  tags:()=>ipcRenderer.invoke('yuque:tags'),
+  openExternal:(url)=>ipcRenderer.invoke('yuque:open-external',url),
+  onAuthChanged:(callback)=>{
+    const listener=(_event:Electron.IpcRendererEvent,state:AuthState):void=>callback(state)
+    ipcRenderer.on('yuque:auth-changed',listener)
+    return ()=>ipcRenderer.removeListener('yuque:auth-changed',listener)
+  }
 }
-contextBridge.exposeInMainWorld('yuque', desktop)
+contextBridge.exposeInMainWorld('yuque',bridge)
