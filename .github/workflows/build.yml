@@ -37,8 +37,10 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: yuque-${{ matrix.name }}
-          path: release/*
-          if-no-files-found: warn
+          path: |
+            release/*.exe
+            release/*.dmg
+          if-no-files-found: error
